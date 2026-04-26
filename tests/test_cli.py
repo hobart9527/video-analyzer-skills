@@ -113,3 +113,23 @@ def test_install_with_skill_filter():
         installed = list(dest.glob("*.md"))
         assert len(installed) == 1
         assert installed[0].name == "gpu-auto-config.md"
+
+
+def test_install_codex_merge():
+    """Test Codex install merges with existing skills.json."""
+    import json
+    runner = CliRunner()
+    with runner.isolated_filesystem() as fs:
+        dest = Path(fs) / ".codex"
+        dest.mkdir(parents=True, exist_ok=True)
+        existing = {"skills": [{"name": "existing-skill", "description": "old"}]}
+        (dest / "skills.json").write_text(json.dumps(existing))
+
+        result = runner.invoke(cli, [
+            "install", "--target", "codex", "--dest", str(dest),
+        ])
+        assert result.exit_code == 0
+        merged = json.loads((dest / "skills.json").read_text())
+        names = [s["name"] for s in merged["skills"]]
+        assert "existing-skill" in names
+        assert "gpu-auto-config" in names

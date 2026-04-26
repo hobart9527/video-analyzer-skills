@@ -44,8 +44,21 @@ Homepage = "https://github.com/hobart9527/video-analyzer-skills"
 Repository = "https://github.com/hobart9527/video-analyzer-skills"
 Issues = "https://github.com/hobart9527/video-analyzer-skills/issues"
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "video_analyzer_skills/",
+    "claude-code/",
+    "codex/",
+    "openclaw/",
+    "tests/",
+    "README.md",
+    "LICENSE",
+    ".github/workflows/ci.yml",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["video_analyzer_skills"]
+artifacts = ["claude-code/", "codex/", "openclaw/"]
 
 [tool.ruff]
 line-length = 100

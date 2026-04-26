@@ -1,7 +1,7 @@
 """Install skills to target AI assistant platforms."""
 
+import json
 import shutil
-import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -60,7 +60,22 @@ def _install_codex(
     dest.mkdir(parents=True, exist_ok=True)
 
     target = dest / "skills.json"
-    shutil.copy2(source, target)
+    new_skills = json.loads(source.read_text(encoding="utf-8"))
+    if target.exists():
+        # Merge with existing skills.json to avoid overwriting
+        existing = json.loads(target.read_text(encoding="utf-8"))
+        existing_names = {s["name"] for s in existing.get("skills", [])}
+        for skill in new_skills.get("skills", []):
+            if skills and skill["name"] not in skills:
+                continue
+            if skill["name"] not in existing_names:
+                existing["skills"].append(skill)
+        target.write_text(
+            json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        shutil.copy2(source, target)
     results.append(str(target))
     return results
 
