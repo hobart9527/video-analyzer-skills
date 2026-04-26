@@ -4,7 +4,12 @@ import click
 
 from video_analyzer_skills import __version__
 from video_analyzer_skills.installer import detect_targets, install
-from video_analyzer_skills.parser import discover_all_skills, find_skill_file
+from video_analyzer_skills.parser import (
+    discover_all_skills,
+    extract_codex_skill,
+    extract_openclaw_skill,
+    find_skill_file,
+)
 
 
 @click.group()
@@ -61,24 +66,29 @@ def show_skill(name: str, plat: str) -> None:
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
+
     if plat == "claude-code":
         source = root / "claude-code" / f"{name}.md"
+        if not source.exists():
+            found = find_skill_file(name)
+            if found:
+                source = found
+            else:
+                click.echo(click.style(f"Skill '{name}' not found.", fg="red"))
+                click.echo(f"Run 'vas list' to see available skills.")
+                raise click.Exit(1)
+        content = source.read_text(encoding="utf-8")
     elif plat == "codex":
-        source = root / "codex" / "skills.json"
-    else:
-        source = root / "openclaw" / "skills.md"
-
-    if not source.exists():
-        # Fallback: try to find by name
-        found = find_skill_file(name)
-        if found:
-            source = found
-        else:
-            click.echo(click.style(f"Skill '{name}' not found.", fg="red"))
-            click.echo(f"Run 'vas list' to see available skills.")
+        content = extract_codex_skill(name, root)
+        if content is None:
+            click.echo(click.style(f"Skill '{name}' not found in Codex skills.", fg="red"))
+            raise click.Exit(1)
+    else:  # openclaw
+        content = extract_openclaw_skill(name, root)
+        if content is None:
+            click.echo(click.style(f"Skill '{name}' not found in OpenClaw skills.", fg="red"))
             raise click.Exit(1)
 
-    content = source.read_text(encoding="utf-8")
     click.echo(content)
 
 

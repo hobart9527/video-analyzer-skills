@@ -43,6 +43,24 @@ def test_show_skill_not_found():
     assert "not found" in result.output
 
 
+def test_show_skill_codex():
+    """Test `vas show gpu-auto-config --platform codex`."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["show", "gpu-auto-config", "--platform", "codex"])
+    assert result.exit_code == 0
+    assert "gpu-auto-config" in result.output
+    assert "Auto-detect" in result.output
+
+
+def test_show_skill_openclaw():
+    """Test `vas show gpu-auto-config --platform openclaw`."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["show", "gpu-auto-config", "--platform", "openclaw"])
+    assert result.exit_code == 0
+    assert "gpu-auto-config" in result.output
+    assert "Trigger" in result.output
+
+
 def test_doctor_command():
     """Test `vas doctor` runs without error."""
     runner = CliRunner()

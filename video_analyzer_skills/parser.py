@@ -136,3 +136,51 @@ def find_skill_file(name: str, root: Optional[Path] = None) -> Optional[Path]:
         if candidate.exists():
             return candidate
     return None
+
+
+def extract_codex_skill(name: str, root: Optional[Path] = None) -> Optional[str]:
+    """Extract a single skill from Codex skills.json as formatted text."""
+    if root is None:
+        root = Path(__file__).resolve().parent.parent
+    json_file = root / "codex" / "skills.json"
+    if not json_file.exists():
+        return None
+    try:
+        data = json.loads(json_file.read_text(encoding="utf-8"))
+        for item in data.get("skills", []):
+            if item.get("name") == name:
+                lines = [
+                    f"# {name}",
+                    "",
+                    f"**Description**: {item.get('description', '')}",
+                    "",
+                    "**Tags**: " + ", ".join(item.get("tags", [])),
+                    "",
+                    "**Prompt**:",
+                    item.get("prompt", ""),
+                ]
+                return "\n".join(lines)
+    except (json.JSONDecodeError, OSError, KeyError):
+        pass
+    return None
+
+
+def extract_openclaw_skill(name: str, root: Optional[Path] = None) -> Optional[str]:
+    """Extract a single skill from OpenClaw skills.md."""
+    if root is None:
+        root = Path(__file__).resolve().parent.parent
+    md_file = root / "openclaw" / "skills.md"
+    if not md_file.exists():
+        return None
+    content = md_file.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(f"## {name}"):
+            # Collect lines until next ## heading or end of file
+            block = [line]
+            for j in range(i + 1, len(lines)):
+                if lines[j].startswith("## ") and not lines[j].startswith("### "):
+                    break
+                block.append(lines[j])
+            return "\n".join(block)
+    return None
