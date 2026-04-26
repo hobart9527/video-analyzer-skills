@@ -1,118 +1,97 @@
 # adaptive-keyframe-extraction
 
-Improve video keyframe extraction with adaptive thresholds, memory-efficient streaming, and scene-change detection.
+## 概述
 
-## Description
+将 video-analyzer 中基于固定阈值的朴素帧差分替换为自适应、流式感知的关键帧提取器。可应对暗光场景、快速剪辑、慢速平移等多样化视频内容，同时避免长视频 OOM。
 
-Replaces the naive fixed-threshold frame differencing in video-analyzer with an adaptive, streaming-aware keyframe extractor that handles diverse video content (dark scenes, fast cuts, slow pans) without OOM errors.
+## 适用场景
 
-## When to use
+- 关键帧遗漏重要场景变化
+- 关键帧中充斥相似帧
+- 处理长视频时内存不足
+- 视频内容运动速度变化大
 
-- When keyframes are missing important scene changes
-- When keyframes are dominated by similar-looking frames
-- When processing long videos causes memory issues
-- When video content has varying motion speeds
+## 参数
 
-## Parameters
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| strategy | string | "adaptive-threshold" | 提取策略："adaptive-threshold" / "histogram" / "multi-frame" |
+| max_memory_mb | float | 512 | 帧缓冲内存预算（MB） |
+| min_scene_duration_sec | float | 1.0 | 相邻关键帧最短时间间隔（秒） |
+| sensitivity | float | 0.5 | 检测灵敏度（0-1） |
 
-- strategy: "adaptive-threshold" | "histogram" | "optical-flow" | "scene-detect"
-- max_memory_mb: Memory budget for frame buffering (default: 512)
-- min_scene_duration_sec: Minimum time between keyframes (default: 1.0)
-- sensitivity: Detection sensitivity 0-1 (default: 0.5)
+## 核心指令
 
-## Current Problems
+替换 `video_analyzer/frame.py` 中的 `VideoProcessor`，解决以下问题：
 
-The existing `VideoProcessor` in `video_analyzer/frame.py` has these issues:
-1. `frame_candidates` stores FULL `np.ndarray` objects — OOM on long videos
-2. `FRAME_DIFFERENCE_THRESHOLD = 10.0` is fixed — fails on dark/bright videos
-3. Only compares to previous frame — misses gradual scene transitions
-4. Two-pass logic (sample then sort) is inefficient
+1. `frame_candidates` 存储完整 `np.ndarray` — 长视频 OOM
+2. `FRAME_DIFFERENCE_THRESHOLD = 10.0` 固定值 — 暗光/强光视频失效
+3. 仅与前一帧比较 — 漏检渐变场景过渡
+4. 两遍逻辑（采样后排序）效率低
 
-## Implementation
+### 1. 内存高效的流式提取器
 
-### 1. Memory-Efficient Streaming Extractor
-
-Replace full-frame storage with metadata-only tracking:
+用元数据替代完整帧存储，使用 `heapq` 实现单遍 top-K：
 
 ```python
 import heapq
 from dataclasses import dataclass
-from typing import Iterator
-import cv2
-import numpy as np
 
 @dataclass
 class FrameCandidate:
     frame_number: int
     timestamp: float
     score: float
-    # NO image data stored here!
 
 class StreamingKeyframeExtractor:
-    def __init__(self, max_frames=10, max_memory_mb=512, min_scene_duration_sec=1.0):
+    def __init__(self, max_frames=10, sensitivity=0.5, min_scene_duration_sec=1.0):
         self.max_frames = max_frames
-        self.max_memory_mb = max_memory_mb
+        self.sensitivity = sensitivity
         self.min_scene_duration = min_scene_duration_sec
-        self._candidates = []  # min-heap of (score, frame_number, timestamp)
+        self._candidates = []  # 最小堆 (score, frame_number, timestamp)
+        self._recent_scores = []
 
-    def process_frame(self, frame_number: int, timestamp: float,
-                      prev_frame: np.ndarray, curr_frame: np.ndarray) -> bool:
-        """Process a single frame. Returns True if it's a keyframe candidate."""
-        score = self._compute_difference(prev_frame, curr_frame)
+    def process_frame(self, frame_number: int, timestamp: float, score: float) -> bool:
+        if len(self._recent_scores) > 100:
+            self._recent_scores.pop(0)
+        self._recent_scores.append(score)
 
-        # Adaptive threshold: use percentile of recent scores
-        if hasattr(self, '_recent_scores'):
-            self._recent_scores.append(score)
-            if len(self._recent_scores) > 100:
-                self._recent_scores.pop(0)
-            threshold = np.percentile(self._recent_scores, 75) * self.sensitivity
-        else:
-            self._recent_scores = [score]
-            threshold = 10.0  # fallback
+        threshold = (np.percentile(self._recent_scores, 75) * self.sensitivity
+                     if len(self._recent_scores) >= 10 else 10.0)
 
         if score > threshold:
             heapq.heappush(self._candidates, (score, frame_number, timestamp))
-            # Evict lowest score if over limit
             if len(self._candidates) > self.max_frames * 2:
                 heapq.heappop(self._candidates)
             return True
         return False
 
-    def get_keyframes(self, cap) -> list[FrameCandidate]:
-        """Extract top frames sorted by time."""
-        # Sort by frame number (time order)
+    def get_keyframes(self) -> list[FrameCandidate]:
         sorted_candidates = sorted(self._candidates, key=lambda x: x[1])
-        # Apply min_scene_duration filter
         filtered = []
         last_ts = -self.min_scene_duration
         for score, fn, ts in sorted_candidates:
             if ts - last_ts >= self.min_scene_duration:
                 filtered.append(FrameCandidate(fn, ts, score))
                 last_ts = ts
-        # Limit to max_frames
         return filtered[:self.max_frames]
 ```
 
-### 2. Adaptive Threshold Based on Scene Statistics
+### 2. 自适应阈值
 
 ```python
 def _compute_adaptive_threshold(self, scores: list[float], sensitivity: float = 0.5) -> float:
-    """Compute adaptive threshold using scene statistics."""
     if len(scores) < 10:
-        return 10.0  # default for short videos
-
+        return 10.0
     median = np.median(scores)
     std = np.std(scores)
-    # Threshold = median + sensitivity * std
-    # This adapts to video's natural motion level
     return max(5.0, median + sensitivity * std)
 ```
 
-### 3. Histogram-Based Difference (Handles lighting changes better)
+### 3. 直方图差异（光照不变）
 
 ```python
 def _compute_histogram_diff(self, frame1: np.ndarray, frame2: np.ndarray) -> float:
-    """Compare color histograms instead of raw pixels."""
     h1 = cv2.calcHist([frame1], [0, 1, 2], None, [8, 8, 8], [0, 256] * 3)
     h2 = cv2.calcHist([frame2], [0, 1, 2], None, [8, 8, 8], [0, 256] * 3)
     h1 = cv2.normalize(h1, h1).flatten()
@@ -120,100 +99,21 @@ def _compute_histogram_diff(self, frame1: np.ndarray, frame2: np.ndarray) -> flo
     return cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA)
 ```
 
-### 4. Multi-Frame Difference (Detects gradual transitions)
+### 4. 多帧差异（渐变检测）
 
 ```python
 def _compute_multi_frame_diff(self, frames: list[np.ndarray]) -> float:
-    """Compare current frame against average of last N frames."""
     if len(frames) < 2:
         return 0.0
     avg_frame = np.mean(frames, axis=0).astype(np.uint8)
     return self._compute_difference(avg_frame, frames[-1])
 ```
 
-## Integration into video_analyzer/frame.py
+## 实现要点
 
-Replace the existing `VideoProcessor` class or create an optimized subclass:
+- 创建 `OptimizedVideoProcessor` 类或替换现有 `VideoProcessor`
+- 在 `default_config.json` 中添加配置节：
 
-```python
-class OptimizedVideoProcessor:
-    def __init__(self, video_path: str, output_dir: str, model=None,
-                 max_frames: int = 10, strategy: str = "adaptive-threshold",
-                 sensitivity: float = 0.5):
-        self.video_path = video_path
-        self.output_dir = Path(output_dir)
-        self.model = model
-        self.max_frames = max_frames
-        self.strategy = strategy
-        self.sensitivity = sensitivity
-
-    def extract_keyframes(self, target_frames: int = None) -> list[Frame]:
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video: {self.video_path}")
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        max_frames = min(target_frames or self.max_frames, self.max_frames)
-
-        extractor = StreamingKeyframeExtractor(
-            max_frames=max_frames,
-            sensitivity=self.sensitivity
-        )
-
-        prev_frame = None
-        frame_buffer = []  # For multi-frame diff
-        frame_number = 0
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if prev_frame is not None:
-                if self.strategy == "histogram":
-                    score = extractor._compute_histogram_diff(prev_frame, frame)
-                elif self.strategy == "multi-frame" and len(frame_buffer) >= 3:
-                    score = extractor._compute_multi_frame_diff(frame_buffer[-3:] + [frame])
-                else:
-                    score = extractor._compute_difference(prev_frame, frame)
-
-                extractor.process_frame(frame_number, frame_number / fps, prev_frame, frame)
-
-            prev_frame = frame
-            frame_buffer.append(frame)
-            if len(frame_buffer) > 5:
-                frame_buffer.pop(0)
-
-            frame_number += 1
-
-        cap.release()
-
-        # Extract and save only the selected keyframes
-        candidates = extractor.get_keyframes(cap)
-        keyframes = []
-
-        cap = cv2.VideoCapture(self.video_path)
-        for candidate in candidates:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, candidate.frame_number)
-            ret, frame = cap.read()
-            if ret:
-                output_path = self.output_dir / f"frame_{candidate.frame_number:04d}.jpg"
-                cv2.imwrite(str(output_path), frame)
-                keyframes.append(Frame(
-                    frame_number=candidate.frame_number,
-                    path=str(output_path),
-                    timestamp=candidate.timestamp,
-                    difference_score=candidate.score
-                ))
-        cap.release()
-
-        return keyframes
-```
-
-## Configuration Update
-
-Add to `default_config.json`:
 ```json
 {
   "frame_extraction": {
@@ -225,10 +125,18 @@ Add to `default_config.json`:
 }
 ```
 
-## Verification
+## 验证清单
 
-- [ ] Process a 2-hour video without OOM
-- [ ] Dark scene video produces meaningful keyframes
-- [ ] Fast-action video captures key moments
-- [ ] Slow-pan video avoids redundant frames
-- [ ] Output frame count matches `max_frames` limit
+- [ ] 2 小时视频处理不触发 OOM
+- [ ] 暗光视频生成有意义的关键帧
+- [ ] 快速动作视频捕获关键时刻
+- [ ] 慢速平移视频避免冗余帧
+- [ ] 输出帧数不超过 `max_frames` 限制
+
+## 示例用法
+
+```
+/adaptive-keyframe-extraction strategy=adaptive-threshold sensitivity=0.6
+/adaptive-keyframe-extraction strategy=histogram max_memory_mb=256
+/adaptive-keyframe-extraction strategy=multi-frame min_scene_duration_sec=2.0
+```

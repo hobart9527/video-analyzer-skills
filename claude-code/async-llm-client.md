@@ -1,30 +1,32 @@
 # async-llm-client
 
-Convert synchronous LLM clients to async for concurrent frame analysis and better resource utilization.
+## 概述
 
-## Description
+将 video-analyzer 中基于 `requests` 的同步 LLM 客户端替换为基于 `httpx` 的异步实现，支持并发 API 调用、连接池和响应式 I/O，为并行帧分析提供基础。
 
-Replaces the blocking `requests`-based LLM clients in video-analyzer with async `httpx`-based implementations, enabling concurrent API calls, connection pooling, and non-blocking I/O throughout the pipeline.
+## 适用场景
 
-## When to use
+- 已实现或计划实现并行帧分析
+- 使用有速率限制的云端 API（异步 + 信号量 = 可控并发）
+- 集成异步 Web 框架（FastAPI 等）
+- UI 需要在分析期间保持响应
 
-- When parallel frame analysis is implemented
-- When using cloud APIs with rate limits (async + semaphore = controlled concurrency)
-- When integrating with async web frameworks (FastAPI, etc.)
-- When the UI needs to remain responsive during analysis
+## 参数
 
-## Parameters
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| client | string | "both" | 转换目标："ollama" / "openai" / "both" |
+| max_connections | int | 10 | 连接池大小 |
+| timeout | float | 60 | 请求超时（秒） |
+| preserve_sync | bool | true | 保留同步 API 作为包装器 |
 
-- client: "ollama" | "openai" | "both"
-- max_connections: Connection pool size (default: 10)
-- timeout: Request timeout in seconds (default: 60)
-- preserve_sync: Keep sync API as wrapper (default: true)
+## 核心指令
 
-## Implementation
+将同步 `requests` 客户端替换为异步 `httpx` 客户端，按以下步骤执行：
 
-### 1. Async Base Client
+### 1. 创建异步基类
 
-Create `video_analyzer/clients/async_llm_client.py`:
+创建 `video_analyzer/clients/async_llm_client.py`：
 
 ```python
 import base64
@@ -33,8 +35,6 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional, Dict, Any, AsyncIterator
 import httpx
-from functools import lru_cache
-import os
 
 class AsyncLLMClient(ABC):
     def __init__(self, timeout: float = 60.0, max_connections: int = 10):
@@ -43,46 +43,16 @@ class AsyncLLMClient(ABC):
         self.client = httpx.AsyncClient(timeout=timeout, limits=limits)
 
     async def encode_image(self, image_path: str) -> str:
-        """Async image encoding with LRU cache support."""
         path = Path(image_path)
         if not path.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
-
-        stat = path.stat()
-        cache_key = (str(path.resolve()), stat.st_mtime, stat.st_size)
-
-        # Check cache
-        cached = self._get_cached_image(cache_key)
-        if cached:
-            return cached
-
         async with asyncio.Lock():
-            # Double-check after acquiring lock
-            cached = self._get_cached_image(cache_key)
-            if cached:
-                return cached
-
             with open(image_path, "rb") as f:
-                encoded = base64.b64encode(f.read()).decode("utf-8")
-
-            self._set_cached_image(cache_key, encoded)
-            return encoded
-
-    def _get_cached_image(self, cache_key):
-        # Implement LRU cache storage
-        pass
-
-    def _set_cached_image(self, cache_key, value):
-        pass
+                return base64.b64encode(f.read()).decode("utf-8")
 
     @abstractmethod
     async def generate(self, prompt: str, image_path: Optional[str] = None,
                        stream: bool = False, **kwargs) -> Dict[str, Any]:
-        pass
-
-    @abstractmethod
-    async def generate_stream(self, prompt: str, image_path: Optional[str] = None,
-                              **kwargs) -> AsyncIterator[str]:
         pass
 
     async def close(self):
@@ -95,16 +65,16 @@ class AsyncLLMClient(ABC):
         await self.close()
 ```
 
-### 2. Async Ollama Client
+### 2. 异步 Ollama 客户端
 
 ```python
 import json
 import httpx
-from typing import Optional, Dict, Any, AsyncIterator
 
 class AsyncOllamaClient(AsyncLLMClient):
-    def __init__(self, host: str = "http://localhost:11434", model: str = "llama3.2-vision",
-                 timeout: float = 120.0, max_connections: int = 10):
+    def __init__(self, host: str = "http://localhost:11434",
+                 model: str = "llama3.2-vision", timeout: float = 120.0,
+                 max_connections: int = 10):
         super().__init__(timeout=timeout, max_connections=max_connections)
         self.host = host.rstrip("/")
         self.model = model
@@ -121,7 +91,6 @@ class AsyncOllamaClient(AsyncLLMClient):
                 "temperature": kwargs.get("temperature", 0.7),
             }
         }
-
         if image_path:
             data["images"] = [await self.encode_image(image_path)]
 
@@ -138,38 +107,12 @@ class AsyncOllamaClient(AsyncLLMClient):
                     except json.JSONDecodeError:
                         continue
             return {"response": "".join(text_parts)}
-        else:
-            return response.json()
-
-    async def generate_stream(self, prompt: str, image_path: Optional[str] = None,
-                              **kwargs) -> AsyncIterator[str]:
-        data = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": True,
-            "options": {"num_predict": kwargs.get("num_predict", 300)}
-        }
-
-        if image_path:
-            data["images"] = [await self.encode_image(image_path)]
-
-        async with self.client.stream("POST", self.generate_url, json=data) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if line.strip():
-                    try:
-                        chunk = json.loads(line)
-                        yield chunk.get("response", "")
-                    except json.JSONDecodeError:
-                        continue
+        return response.json()
 ```
 
-### 3. Async OpenAI-Compatible Client
+### 3. 异步 OpenAI 兼容客户端
 
 ```python
-import json
-from typing import Optional, Dict, Any, AsyncIterator
-
 class AsyncOpenAIClient(AsyncLLMClient):
     def __init__(self, api_key: str, base_url: str, model: str = "gpt-4o",
                  timeout: float = 60.0, max_connections: int = 10):
@@ -182,7 +125,6 @@ class AsyncOpenAIClient(AsyncLLMClient):
     async def generate(self, prompt: str, image_path: Optional[str] = None,
                        stream: bool = False, **kwargs) -> Dict[str, Any]:
         messages = [{"role": "user", "content": prompt}]
-
         if image_path:
             encoded = await self.encode_image(image_path)
             messages[0]["content"] = [
@@ -197,7 +139,6 @@ class AsyncOpenAIClient(AsyncLLMClient):
             "max_tokens": kwargs.get("max_tokens", 300),
             "temperature": kwargs.get("temperature", 0.7),
         }
-
         headers = {"Authorization": f"Bearer {self.api_key}"}
         response = await self.client.post(self.chat_url, json=data, headers=headers)
         response.raise_for_status()
@@ -216,125 +157,69 @@ class AsyncOpenAIClient(AsyncLLMClient):
                     except (json.JSONDecodeError, KeyError):
                         continue
             return {"response": "".join(text_parts)}
-        else:
-            result = response.json()
-            return {"response": result["choices"][0]["message"]["content"]}
 
-    async def generate_stream(self, prompt: str, image_path: Optional[str] = None,
-                              **kwargs) -> AsyncIterator[str]:
-        messages = [{"role": "user", "content": prompt}]
-
-        if image_path:
-            encoded = await self.encode_image(image_path)
-            messages[0]["content"] = [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}}
-            ]
-
-        data = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            "max_tokens": kwargs.get("max_tokens", 300),
-        }
-
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        async with self.client.stream("POST", self.chat_url, json=data, headers=headers) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if line.startswith("data: "):
-                    line = line[6:]
-                if line and line != "[DONE]":
-                    try:
-                        chunk = json.loads(line)
-                        delta = chunk["choices"][0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            yield content
-                    except (json.JSONDecodeError, KeyError):
-                        continue
+        result = response.json()
+        return {"response": result["choices"][0]["message"]["content"]}
 ```
 
-### 4. Backward-Compatible Sync Wrappers
-
-```python
-class OllamaClient:
-    """Sync wrapper around AsyncOllamaClient for backward compatibility."""
-    def __init__(self, *args, **kwargs):
-        self._async_client = AsyncOllamaClient(*args, **kwargs)
-        self._loop = None
-
-    def generate(self, prompt, image_path=None, stream=False, **kwargs):
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            # We're in an async context - use run_coroutine_threadsafe
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_client.generate(prompt, image_path, stream, **kwargs),
-                loop
-            )
-            return future.result()
-        except RuntimeError:
-            # No running loop - use asyncio.run
-            return asyncio.run(self._async_client.generate(prompt, image_path, stream, **kwargs))
-
-    def close(self):
-        import asyncio
-        try:
-            asyncio.run(self._async_client.close())
-        except:
-            pass
-```
-
-### 5. Retry with Exponential Backoff
+### 4. 带退避的重试
 
 ```python
 import random
 
 async def with_retry(coro, max_retries: int = 3, base_delay: float = 1.0,
                      max_delay: float = 60.0, retryable_statuses=(429, 502, 503, 504)):
-    """Execute coroutine with exponential backoff retry."""
     for attempt in range(max_retries):
         try:
             return await coro
         except httpx.HTTPStatusError as e:
             if e.response.status_code not in retryable_statuses:
                 raise
-
             if attempt == max_retries - 1:
                 raise
-
-            # Check for Retry-After header
             retry_after = e.response.headers.get("Retry-After")
-            if retry_after:
-                delay = float(retry_after)
-            else:
-                delay = min(base_delay * (2 ** attempt) + random.random(), max_delay)
-
+            delay = float(retry_after) if retry_after else min(base_delay * (2 ** attempt) + random.random(), max_delay)
             await asyncio.sleep(delay)
 ```
 
-## Integration Checklist
+### 5. 向后兼容的同步包装器
 
-- [ ] Install `httpx`: `pip install httpx`
-- [ ] Create async client classes
-- [ ] Update `analyzer.py` to use async `generate()`
-- [ ] Update `cli.py` to run async pipeline with `asyncio.run()`
-- [ ] Add `async with` context management for proper cleanup
-- [ ] Verify sync wrappers preserve existing CLI behavior
-- [ ] Test concurrent frame analysis with semaphore
+```python
+class OllamaClient:
+    def __init__(self, *args, **kwargs):
+        self._async_client = AsyncOllamaClient(*args, **kwargs)
 
-## Dependencies
+    def generate(self, prompt, image_path=None, stream=False, **kwargs):
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                self._async_client.generate(prompt, image_path, stream, **kwargs), loop
+            )
+            return future.result()
+        except RuntimeError:
+            return asyncio.run(self._async_client.generate(prompt, image_path, stream, **kwargs))
+```
+
+## 实现要点
+
+- 安装依赖：`pip install httpx`
+- 更新 `analyzer.py` 使用异步 `generate()`
+- 更新 `cli.py` 使用 `asyncio.run()` 运行异步流水线
+- 使用 `async with` 确保资源正确释放
+
+## 验证清单
+
+- [ ] 单帧分析与同步版本行为一致
+- [ ] 并发请求比串行更快完成
+- [ ] 连接池限制被正确遵守
+- [ ] 429 速率限制触发退避重试
+- [ ] 退出时资源正确释放
+
+## 示例用法
 
 ```
-httpx>=0.27.0
+/async-llm-client client=both max_connections=10
+/async-llm-client client=ollama timeout=120 preserve_sync=true
+/async-llm-client client=openai max_connections=20
 ```
-
-## Verification
-
-- [ ] Single frame analysis works identically to sync version
-- [ ] Concurrent requests complete faster than sequential
-- [ ] Connection pool limits are respected
-- [ ] Rate limit 429 triggers retry with backoff
-- [ ] Resources are properly cleaned up on exit

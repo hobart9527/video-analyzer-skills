@@ -1,39 +1,34 @@
 # parallel-frame-analysis
 
-Convert sequential frame-by-frame video analysis to parallel/batch processing for significant speedup.
+## 概述
 
-## Description
+将 video-analyzer 中串行的逐帧分析循环替换为并行/批处理，显著缩短帧分析阶段耗时。支持独立并行、滑动窗口和 API 批量三种模式。
 
-Optimizes the video-analyzer's frame analysis stage by replacing the sequential `for frame in frames: analyzer.analyze_frame(frame)` loop with concurrent processing. Frames that don't depend on each other can be analyzed in parallel; context-dependent frames use a sliding window approach.
+## 适用场景
 
-## When to use
+- 关键帧数量较多（> 20 帧）
+- 使用支持高并发的云端 LLM API
+- 本地 GPU 有闲置算力可并行推理
+- 批量视频处理任务
 
-- When analyzing videos with many keyframes (>20)
-- When using cloud LLM APIs that support higher concurrency
-- When local GPU has spare capacity for parallel inference
-- When processing batch video jobs
+## 参数
 
-## Parameters
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| concurrency | int | 4 | 最大并行请求数（上限 16） |
+| mode | string | "sliding-window" | 并行模式："parallel-independent" / "sliding-window" / "batch-api" |
+| window_size | int | 3 | 滑动窗口中保留的上下文帧数 |
+| provider | string | "auto" | LLM 提供商："ollama" / "openai" / "auto" |
 
-- concurrency: Maximum parallel requests (default: 4, max: 16)
-- mode: "parallel-independent" | "sliding-window" | "batch-api"
-- window_size: Number of previous frames to include as context (default: 3)
-- provider: "ollama" | "openai" | "auto" (determines batch capabilities)
+## 核心指令
 
-## Instructions
+将 video-analyzer 中的串行帧分析循环 `for frame in frames: analyzer.analyze_frame(frame)` 替换为并行处理。
 
-1. Locate the frame analysis loop in `video_analyzer/cli.py` and `video_analyzer/analyzer.py`
-2. Determine the dependency model: does the LLM need ALL previous frames or just recent context?
-3. Implement the selected `mode`:
+### 模式一：parallel-independent（独立并行）
 
-### Mode: parallel-independent
-
-For frames that can be analyzed independently (no cross-frame context):
+适用于帧间无依赖关系的分析场景。使用 `asyncio.Semaphore` + `asyncio.gather()` 控制并发：
 
 ```python
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-
 async def analyze_frames_parallel(analyzer, frames, max_concurrency=4):
     semaphore = asyncio.Semaphore(max_concurrency)
 
@@ -45,27 +40,25 @@ async def analyze_frames_parallel(analyzer, frames, max_concurrency=4):
     return await asyncio.gather(*tasks)
 ```
 
-### Mode: sliding-window
+### 模式二：sliding-window（滑动窗口）
 
-For context-dependent analysis, limit history to prevent prompt explosion:
+适用于需要上下文依赖的分析。将 `previous_analyses` 限制为最近 N 帧，防止提示词长度爆炸：
 
 ```python
 async def analyze_frames_sliding_window(analyzer, frames, window_size=3):
     results = []
     for i, frame in enumerate(frames):
-        # Only include last N frames as context
         recent_context = results[-window_size:] if i > 0 else []
         result = await analyzer.analyze_frame_async(
-            frame,
-            previous_analyses=recent_context  # pass limited context
+            frame, previous_analyses=recent_context
         )
         results.append(result)
     return results
 ```
 
-### Mode: batch-api
+### 模式三：batch-api（API 批量）
 
-For OpenAI-compatible APIs that support batch requests:
+适用于 OpenAI 兼容 API。将多帧打包为单个请求：
 
 ```python
 async def analyze_frames_batch(client, frames, batch_size=8):
@@ -78,11 +71,10 @@ async def analyze_frames_batch(client, frames, batch_size=8):
     return results
 ```
 
-## Key Changes Required
+## 实现要点
 
-### In `video_analyzer/analyzer.py`:
+1. 在 `video_analyzer/analyzer.py` 中添加异步变体 `analyze_frame_async()`：
 
-1. Add async variant of `analyze_frame()`:
 ```python
 async def analyze_frame_async(self, frame, previous_analyses=None):
     prompt = self.prompt_loader.get_by_index(0)
@@ -94,72 +86,34 @@ async def analyze_frame_async(self, frame, previous_analyses=None):
     prompt = prompt.replace("{PREVIOUS_FRAMES}", formatted)
     prompt = prompt.replace("{prompt}", self.user_prompt)
 
-    # Use async client
     response = await self.llm_client.generate_async(
-        prompt=prompt,
-        image_path=frame.path,
-        stream=False
+        prompt=prompt, image_path=frame.path, stream=False
     )
     return response['response']
 ```
 
-2. Add `generate_async()` to LLM clients or wrap sync calls with `asyncio.to_thread()`:
-```python
-async def generate_async(self, prompt, image_path=None, **kwargs):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: self.generate(prompt, image_path, **kwargs)
-    )
+2. 为 LLM 客户端添加 `generate_async()`，或使用 `asyncio.to_thread()` 包装同步调用。
+
+3. 在 `video_analyzer/cli.py` 中替换串行循环为异步并行处理，使用 `asyncio.run()` 运行。
+
+## 验证清单
+
+- [ ] `concurrency >= 2` 时帧分析时间至少提升 2 倍
+- [ ] 并行与串行输出质量一致（可对比验证）
+- [ ] 默认并发下不触发 API 速率限制错误
+- [ ] 进度报告正常工作（如已实现）
+
+## 注意事项
+
+- **Ollama 并发**：Ollama 会队列化并行请求，高并发不一定线性加速。建议通过 `ollama ps` 监控实际 GPU 利用率。
+- **速率限制**：云端 API 有速率限制，需添加重试/退避逻辑并尊重 `Retry-After` 响应头。
+- **上下文丢失**：滑动窗口可防止提示词长度爆炸，但可能丢失远距离上下文。建议根据视频类型调整 `window_size`。
+- **内存**：并行分析会同时持有多个帧和响应结果，超长视频建议分块处理。
+
+## 示例用法
+
 ```
-
-### In `video_analyzer/cli.py`:
-
-Replace the sequential loop:
-```python
-# BEFORE
-for frame in frames:
-    analysis = analyzer.analyze_frame(frame, previous_analyses)
-    frame_analyses.append(analysis)
-    previous_analyses.append(analysis)
+/parallel-frame-analysis concurrency=4 mode=sliding-window
+/parallel-frame-analysis concurrency=8 mode=parallel-independent provider=openai
+/parallel-frame-analysis mode=batch-api window_size=5
 ```
-
-With async parallel processing:
-```python
-# AFTER
-async def run_stage_2(analyzer, frames, config):
-    mode = config.get("analysis_mode", "sliding-window")
-    concurrency = config.get("concurrency", 4)
-    window_size = config.get("window_size", 3)
-
-    if mode == "parallel-independent":
-        return await analyze_frames_parallel(analyzer, frames, concurrency)
-    elif mode == "sliding-window":
-        return await analyze_frames_sliding_window(analyzer, frames, window_size)
-    # ... etc
-
-frame_analyses = asyncio.run(run_stage_2(analyzer, frames, config))
-```
-
-## Performance Expectations
-
-| Scenario | Before | After | Speedup |
-|----------|--------|-------|---------|
-| 30 frames, cloud API | 60s | 15s | 4x |
-| 30 frames, local Ollama | 120s | 40s | 3x |
-| 100 frames, cloud API | 200s | 25s | 8x |
-| 100 frames, local GPU | 400s | 100s | 4x |
-
-## Constraints & Warnings
-
-- **Ollama concurrency**: Ollama queues parallel requests; high concurrency may not linearly speed up. Monitor `ollama ps`.
-- **Rate limits**: Cloud APIs have rate limits. Add retry/backoff and respect `Retry-After` headers.
-- **Context limits**: Sliding window prevents prompt length explosion but may lose distant context. Tune `window_size` per video type.
-- **Memory**: Parallel analysis holds multiple frames/responses in memory. For very long videos, process in chunks.
-
-## Verification
-
-- [ ] Frame analysis time improves by at least 2x with `concurrency >= 2`
-- [ ] Results quality is preserved (compare sequential vs parallel output)
-- [ ] No rate limit errors with default concurrency
-- [ ] Progress reporting still works (if implemented)

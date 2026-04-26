@@ -1,204 +1,154 @@
 # gpu-auto-config
 
-Auto-detect available hardware (CUDA, MPS, CPU) and optimize video-analyzer settings accordingly.
+## 概述
 
-## Description
+自动检测运行环境的 GPU 加速能力（CUDA、MPS、ROCm），并自动配置 video-analyzer 各组件（Whisper 转录、LLM 推理、帧处理）使用最优计算设置。
 
-Analyzes the runtime environment for GPU acceleration capabilities and automatically configures video-analyzer components (Whisper transcription, LLM inference, frame processing) to use optimal compute settings.
+## 适用场景
 
-## When to use
+- 在新机器上首次部署 video-analyzer
+- 处理速度异常缓慢（可能在 CPU 上运行）
+- 本地与云端环境之间迁移
+- 用户不确定硬件能力
 
-- When setting up video-analyzer on a new machine
-- When performance is unexpectedly slow (might be running on CPU)
-- When migrating between local and cloud environments
-- When the user is unsure about their hardware capabilities
+## 参数
 
-## Parameters
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| force_device | string | 自动检测 | 强制覆盖："cuda" / "mps" / "cpu" |
+| whisper_compute_type | string | 自动检测 | 强制精度："float16" / "int8" / "float32" |
+| verbose | bool | true | 是否打印检测到的硬件详情 |
 
-- force_device: Override auto-detection ("cuda" | "mps" | "cpu")
-- whisper_compute_type: Override Whisper precision ("float16" | "int8" | "float32")
-- verbose: Print detected hardware details (default: true)
+## 核心指令
 
-## Detection Logic
+实现硬件自动检测，按以下优先级选择设备：CUDA > MPS（Apple Silicon）> ROCm > CPU。
+
+### 1. 设备检测逻辑
 
 ```python
 import torch
 import subprocess
 import os
 
-def detect_optimal_device() -> tuple[str, str]:
-    """
-    Returns (device, compute_type, llm_backend)
-    Priority: CUDA > MPS (Apple Silicon) > CPU
-    """
-    # Check CUDA
+def detect_optimal_device() -> tuple[str, str, str]:
+    """返回 (device, compute_type, llm_backend)"""
+    # CUDA
     if torch.cuda.is_available():
         device = "cuda"
-        # Check if float16 is supported
         capability = torch.cuda.get_device_capability()
-        if capability[0] >= 7:  # Turing and newer
-            compute_type = "float16"
-        else:
-            compute_type = "int8"
-        llm_backend = "cuda"
-        return device, compute_type, llm_backend
+        compute_type = "float16" if capability[0] >= 7 else "int8"
+        return device, compute_type, "cuda"
 
-    # Check Apple Silicon MPS
+    # Apple Silicon MPS
     if torch.backends.mps.is_available():
-        device = "mps"
-        compute_type = "float16"
-        llm_backend = "mps"
-        return device, compute_type, llm_backend
+        return "mps", "float16", "mps"
 
-    # Check for AMD ROCm
+    # AMD ROCm
     if hasattr(torch.version, 'hip') and torch.version.hip is not None:
-        device = "cuda"  # ROCm uses cuda device string
-        compute_type = "float16"
-        llm_backend = "rocm"
-        return device, compute_type, llm_backend
+        return "cuda", "float16", "rocm"
 
-    # CPU fallback
+    # CPU
     device = "cpu"
-    # Check for AVX2 support for faster CPU inference
     try:
         import cpuinfo
-        info = cpuinfo.get_cpu_info()
-        flags = info.get('flags', [])
-        if 'avx2' in flags:
-            compute_type = "int8"  # int8 is faster on CPU with AVX2
-        else:
-            compute_type = "float32"
+        flags = cpuinfo.get_cpu_info().get('flags', [])
+        compute_type = "int8" if 'avx2' in flags else "float32"
     except ImportError:
         compute_type = "float32"
+    return device, compute_type, "cpu"
+```
 
-    llm_backend = "cpu"
-    return device, compute_type, llm_backend
+### 2. Ollama GPU 检测
 
-
+```python
 def detect_ollama_gpu() -> bool:
-    """Check if Ollama is using GPU acceleration."""
     try:
-        result = subprocess.run(
-            ["ollama", "ps"], capture_output=True, text=True, timeout=5
-        )
+        result = subprocess.run(["ollama", "ps"], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
-            output = result.stdout
-            # Ollama ps shows GPU memory if using GPU
-            return "%/GPU" in output or any("GPU" in line for line in output.split("\n"))
+            return "%/GPU" in result.stdout or any("GPU" in line for line in result.stdout.split("\n"))
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return False
-
-
-def get_optimal_workers(device: str) -> int:
-    """Get optimal number of parallel workers based on device."""
-    if device == "cuda":
-        # Use number of GPUs * 2 for I/O overlap
-        return torch.cuda.device_count() * 2
-    elif device == "mps":
-        # MPS benefits from limited concurrency
-        return 2
-    else:
-        # CPU: use half of cores for Whisper, leave room for other tasks
-        return max(1, os.cpu_count() // 2)
 ```
 
-## Configuration Updates
+### 3. 最优并发数
 
-### Update `video_analyzer/config.py`:
+```python
+def get_optimal_workers(device: str) -> int:
+    if device == "cuda":
+        return torch.cuda.device_count() * 2
+    elif device == "mps":
+        return 2
+    return max(1, os.cpu_count() // 2)
+```
+
+### 4. 配置集成
+
+更新 `video_analyzer/config.py`：
 
 ```python
 def apply_hardware_defaults(config: dict) -> dict:
-    """Auto-populate hardware-optimized defaults."""
-    device, compute_type, llm_backend = detect_optimal_device()
-
-    # Whisper settings
+    device, compute_type, _ = detect_optimal_device()
     if "audio" not in config:
         config["audio"] = {}
     config["audio"]["device"] = device
     config["audio"]["compute_type"] = compute_type
-
-    # LLM settings
-    if "clients" not in config:
-        config["clients"] = {}
-
-    # Check if Ollama is GPU-accelerated
     if detect_ollama_gpu():
-        config["clients"]["ollama_gpu"] = True
-
-    # Parallelism settings
+        config.setdefault("clients", {})["ollama_gpu"] = True
     config["max_workers"] = get_optimal_workers(device)
-
     return config
 ```
 
-### Update `video_analyzer/audio_processor.py`:
+### 5. 音频处理器更新
 
 ```python
 class AudioProcessor:
     def __init__(self, model_size="base", device=None, compute_type=None):
         from .config import detect_optimal_device
-
         if device is None or compute_type is None:
-            detected_device, detected_compute, _ = detect_optimal_device()
-            device = device or detected_device
-            compute_type = compute_type or detected_compute
-
+            d, c, _ = detect_optimal_device()
+            device = device or d
+            compute_type = compute_type or c
         self.device = device
         self.compute_type = compute_type
-
-        # faster_whisper auto-detects but we explicitly set for clarity
-        self.model = WhisperModel(
-            model_size,
-            device=device,
-            compute_type=compute_type
-        )
+        self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
 ```
 
-### Update CLI output:
+### 6. 启动信息输出
 
 ```python
 def print_hardware_info():
     device, compute_type, backend = detect_optimal_device()
-    print(f"Hardware Detection:")
-    print(f"  Device: {device}")
+    print(f"硬件检测:")
+    print(f"  设备: {device}")
     print(f"  Whisper compute_type: {compute_type}")
-    print(f"  Parallel workers: {get_optimal_workers(device)}")
+    print(f"  并行 workers: {get_optimal_workers(device)}")
     if device == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     elif device == "mps":
-        print(f"  Backend: Apple Metal Performance Shaders")
-    print(f"  Ollama GPU: {'Yes' if detect_ollama_gpu() else 'No/Unknown'}")
+        print(f"  后端: Apple Metal Performance Shaders")
+    print(f"  Ollama GPU: {'是' if detect_ollama_gpu() else '否/未知'}")
 ```
 
-## Ollama GPU Configuration Helper
+## 实现要点
 
-```python
-def configure_ollama_gpu():
-    """Provide instructions for enabling GPU in Ollama."""
-    tips = []
+- 可选依赖：`py-cpuinfo`（用于 CPU 特性检测）
+- 支持 `force_device` 参数强制覆盖自动检测结果
+- 配置保存到 `config.json` 供后续运行复用
 
-    if sys.platform == "darwin":
-        tips.append("macOS: Ollama automatically uses Metal on Apple Silicon")
-    elif sys.platform == "linux":
-        tips.append("Linux: Ensure nvidia-docker or CUDA drivers are installed")
-        tips.append("Set OLLAMA_GPU_OVERHEAD env var if VRAM is limited")
-    elif sys.platform == "win32":
-        tips.append("Windows: Use WSL2 with CUDA support for GPU acceleration")
+## 验证清单
 
-    # Check OLLAMA_HOST
-    ollama_host = os.environ.get("OLLAMA_HOST", "localhost")
-    if ollama_host != "localhost":
-        tips.append(f"Remote Ollama at {ollama_host}: GPU status depends on remote server")
+- [ ] CUDA 机器上 Whisper 使用 GPU，`torch.cuda.is_available()` 为 True
+- [ ] M1/M2/M3 Mac 上 Whisper 使用 MPS，转录速度明显快于 CPU
+- [ ] 纯 CPU 机器优雅降级到 int8/float32
+- [ ] Ollama GPU 状态正确报告
+- [ ] 配置保存后下次运行自动复用
 
-    return "\n".join(tips)
+## 示例用法
+
 ```
-
-## Verification
-
-- [ ] On CUDA machine: Whisper uses GPU, `torch.cuda.is_available()` is True
-- [ ] On M1/M2/M3 Mac: Whisper uses MPS, transcription is faster than CPU
-- [ ] On CPU-only machine: Falls back gracefully to int8/float32
-- [ ] Ollama GPU status is correctly reported
-- [ ] Configuration is saved for subsequent runs
+/gpu-auto-config
+/gpu-auto-config force_device=cuda whisper_compute_type=float16
+/gpu-auto-config verbose=true
+```

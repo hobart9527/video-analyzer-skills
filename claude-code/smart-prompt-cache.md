@@ -1,30 +1,32 @@
 # smart-prompt-cache
 
-Add intelligent caching to prompt loading, frame analysis results, and configuration for faster repeated runs.
+## 概述
 
-## Description
+为 video-analyzer 添加多级缓存机制，消除冗余 I/O 和重复 LLM 推理。包含提示词模板缓存（内存 LRU）、分析结果缓存（SQLite 磁盘缓存）和配置缓存（文件变更感知）。
 
-Eliminates redundant I/O and repeated LLM inference by caching prompt templates, image encodings, and analysis results. Significantly speeds up re-runs, testing, and iterative prompt tuning.
+## 适用场景
 
-## When to use
+- 同一视频多次运行分析
+- 调优提示词后反复测试
+- 处理包含相同片段的多视频（如片头片尾）
+- 提示词文件在运行期间不变
 
-- When running analysis multiple times on the same video
-- When tuning prompts and re-running the same frames
-- When the same frames appear in multiple videos (e.g., intros)
-- When prompt files don't change between runs
+## 参数
 
-## Parameters
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| cache_dir | string | "~/.cache/video-analyzer" | 缓存目录 |
+| max_cache_mb | float | 1024 | 缓存大小上限（MB） |
+| cache_ttl_hours | float | 168 | 缓存生存时间（小时，默认 7 天） |
+| cache_analyses | bool | true | 是否缓存 LLM 分析结果 |
 
-- cache_dir: Directory for cache storage (default: `~/.cache/video-analyzer`)
-- max_cache_mb: Maximum cache size in MB (default: 1024)
-- cache_analyses: Whether to cache LLM analysis results (default: true)
-- cache_ttl_hours: Cache time-to-live in hours (default: 168 = 7 days)
+## 核心指令
 
-## Implementation
+实现三级缓存系统：
 
-### 1. Prompt Loader Cache
+### 1. 提示词加载器缓存
 
-Replace `video_analyzer/prompt.py`:
+替换 `video_analyzer/prompt.py`：
 
 ```python
 import functools
@@ -37,15 +39,11 @@ class CachedPromptLoader:
     def __init__(self, prompt_dir, prompts, cache_dir: Optional[str] = None):
         self.prompt_dir = Path(prompt_dir) if prompt_dir else None
         self.prompts = prompts or []
-        self._cache = {}  # In-memory cache
-        self._path_index = {}  # name -> path mapping
-
-        # Build path index at init
+        self._cache = {}
+        self._path_index = {}
         self._build_path_index()
 
     def _build_path_index(self):
-        """Pre-scan all prompt locations to avoid repeated disk checks."""
-        # Package prompts
         try:
             pkg_path = Path(importlib.resources.files('video_analyzer')) / 'prompts'
             if pkg_path.exists():
@@ -53,48 +51,41 @@ class CachedPromptLoader:
                     self._path_index[f.stem] = f
         except ImportError:
             pass
-
-        # User prompts
         if self.prompt_dir and self.prompt_dir.exists():
             for f in self.prompt_dir.glob("*.txt"):
                 self._path_index[f.stem] = f
 
     @functools.lru_cache(maxsize=32)
     def get_by_index(self, index: int) -> str:
-        """Cached by index. LRU cache avoids repeated file reads."""
         if index >= len(self.prompts):
             raise IndexError(f"Prompt index {index} out of range")
         return self._load_prompt(self.prompts[index])
 
     @functools.lru_cache(maxsize=32)
     def get_by_name(self, name: str) -> str:
-        """Cached by name."""
         path = self._path_index.get(name)
         if not path:
-            raise FileNotFoundError(f"Prompt '{name}' not found in {list(self._path_index.keys())}")
+            raise FileNotFoundError(f"Prompt '{name}' not found")
         return self._load_prompt(str(path))
 
     def _load_prompt(self, prompt_path: str) -> str:
-        """Load prompt from pre-resolved path."""
         path = Path(prompt_path)
         if not path.exists():
             raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
         return path.read_text().strip()
 
     def invalidate_cache(self):
-        """Clear all caches. Call when prompt files change."""
         self.get_by_index.cache_clear()
         self.get_by_name.cache_clear()
         self._cache.clear()
 ```
 
-### 2. Disk-Based Result Cache
+### 2. 磁盘分析结果缓存（SQLite）
 
-Create `video_analyzer/cache.py`:
+创建 `video_analyzer/cache.py`：
 
 ```python
 import hashlib
-import json
 import pickle
 import time
 from pathlib import Path
@@ -102,16 +93,12 @@ from typing import Any, Optional
 import sqlite3
 
 class AnalysisCache:
-    """Disk-backed cache for LLM analysis results using SQLite."""
-
     def __init__(self, cache_dir: str = "~/.cache/video-analyzer",
-                 max_size_mb: float = 1024.0,
-                 ttl_hours: float = 168.0):
+                 max_size_mb: float = 1024.0, ttl_hours: float = 168.0):
         self.cache_dir = Path(cache_dir).expanduser()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_size_mb = max_size_mb
         self.ttl_seconds = ttl_hours * 3600
-
         self.db_path = self.cache_dir / "cache.db"
         self._init_db()
 
@@ -119,144 +106,93 @@ class AnalysisCache:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    value BLOB,
-                    created_at REAL,
-                    size_bytes INTEGER
+                    key TEXT PRIMARY KEY, value BLOB, created_at REAL, size_bytes INTEGER
                 )
             """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_created_at ON cache(created_at)
-            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON cache(created_at)")
             conn.commit()
 
-    def _compute_key(self, prompt: str, image_path: str, model: str,
-                     temperature: float = 0.7) -> str:
-        """Compute deterministic cache key."""
-        # Include image modification time for cache invalidation
+    def _compute_key(self, prompt: str, image_path: str, model: str, temperature: float = 0.7) -> str:
         img_mtime = Path(image_path).stat().st_mtime if Path(image_path).exists() else 0
         content = f"{prompt}:{image_path}:{img_mtime}:{model}:{temperature}"
         return hashlib.sha256(content.encode()).hexdigest()
 
-    def get(self, prompt: str, image_path: str, model: str,
-            temperature: float = 0.7) -> Optional[Any]:
-        """Get cached analysis result if valid."""
+    def get(self, prompt: str, image_path: str, model: str, temperature: float = 0.7) -> Optional[Any]:
         key = self._compute_key(prompt, image_path, model, temperature)
-
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT value, created_at FROM cache WHERE key = ?",
-                (key,)
-            ).fetchone()
-
+            row = conn.execute("SELECT value, created_at FROM cache WHERE key = ?", (key,)).fetchone()
             if row is None:
                 return None
-
             value, created_at = row
             if time.time() - created_at > self.ttl_seconds:
-                # Expired
                 conn.execute("DELETE FROM cache WHERE key = ?", (key,))
                 conn.commit()
                 return None
-
             return pickle.loads(value)
 
-    def set(self, prompt: str, image_path: str, model: str,
-            temperature: float, value: Any):
-        """Store analysis result in cache."""
+    def set(self, prompt: str, image_path: str, model: str, temperature: float, value: Any):
         key = self._compute_key(prompt, image_path, model, temperature)
         serialized = pickle.dumps(value)
         size = len(serialized)
-
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO cache (key, value, created_at, size_bytes)
-                   VALUES (?, ?, ?, ?)""",
+                "INSERT OR REPLACE INTO cache (key, value, created_at, size_bytes) VALUES (?, ?, ?, ?)",
                 (key, serialized, time.time(), size)
             )
             conn.commit()
-
         self._cleanup_if_needed()
 
     def _cleanup_if_needed(self):
-        """Remove old entries if cache exceeds max size."""
         with sqlite3.connect(self.db_path) as conn:
-            total = conn.execute(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM cache"
-            ).fetchone()[0]
-
+            total = conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM cache").fetchone()[0]
             if total < self.max_size_mb * 1024 * 1024:
                 return
-
-            # Delete oldest entries until under limit
             to_delete = []
-            cursor = conn.execute(
-                "SELECT key, size_bytes FROM cache ORDER BY created_at"
-            )
             current_size = total
-            for key, size in cursor:
+            for key, size in conn.execute("SELECT key, size_bytes FROM cache ORDER BY created_at"):
                 if current_size < self.max_size_mb * 1024 * 1024 * 0.8:
                     break
                 to_delete.append(key)
                 current_size -= size
-
             for key in to_delete:
                 conn.execute("DELETE FROM cache WHERE key = ?", (key,))
             conn.commit()
 
     def clear(self):
-        """Clear all cached entries."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM cache")
             conn.commit()
 
     def stats(self) -> dict:
-        """Return cache statistics."""
         with sqlite3.connect(self.db_path) as conn:
-            count, total_size = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM cache"
-            ).fetchone()
-
-        return {
-            "entries": count,
-            "size_mb": total_size / (1024 * 1024),
-            "max_size_mb": self.max_size_mb,
-            "db_path": str(self.db_path),
-        }
+            count, total_size = conn.execute("SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM cache").fetchone()
+        return {"entries": count, "size_mb": total_size / (1024 * 1024), "max_size_mb": self.max_size_mb}
 ```
 
-### 3. Cached LLM Client Wrapper
+### 3. 带缓存的 LLM 客户端包装器
 
 ```python
 class CachedLLMClient:
-    """Wrapper that adds caching to any LLM client."""
-
     def __init__(self, client, cache: Optional[AnalysisCache] = None):
         self.client = client
         self.cache = cache
 
     async def generate(self, prompt: str, image_path: Optional[str] = None,
                        stream: bool = False, **kwargs) -> dict:
-        # Don't cache streaming requests
         if stream or self.cache is None or image_path is None:
             return await self._generate(prompt, image_path, stream, **kwargs)
-
         model = getattr(self.client, 'model', 'unknown')
         temperature = kwargs.get('temperature', 0.7)
-
         cached = self.cache.get(prompt, image_path, model, temperature)
         if cached is not None:
             return cached
-
         result = await self._generate(prompt, image_path, stream, **kwargs)
         self.cache.set(prompt, image_path, model, temperature, result)
         return result
 
     async def _generate(self, prompt, image_path, stream, **kwargs):
-        # Delegate to wrapped client
         if hasattr(self.client, 'generate_async'):
             return await self.client.generate_async(prompt, image_path, stream, **kwargs)
-        # Fallback to sync wrapped in thread
         import asyncio
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
@@ -264,16 +200,13 @@ class CachedLLMClient:
         )
 ```
 
-### 4. Configuration Cache
+### 4. 配置缓存
 
 ```python
-import functools
 import json
 from pathlib import Path
 
 class CachedConfig:
-    """Config with file-change-aware caching."""
-
     def __init__(self, config_path: str):
         self.config_path = Path(config_path)
         self._cached_config = None
@@ -283,12 +216,10 @@ class CachedConfig:
     def config(self) -> dict:
         if not self.config_path.exists():
             return {}
-
         mtime = self.config_path.stat().st_mtime
         if mtime != self._cached_mtime or self._cached_config is None:
             self._cached_config = json.loads(self.config_path.read_text())
             self._cached_mtime = mtime
-
         return self._cached_config
 
     def get(self, key: str, default=None):
@@ -304,24 +235,23 @@ class CachedConfig:
         return value
 ```
 
-## Integration
+## 实现要点
 
-In `cli.py`, wrap the analyzer:
-```python
-cache = AnalysisCache(
-    cache_dir=config.get("cache_dir", "~/.cache/video-analyzer"),
-    max_size_mb=config.get("max_cache_mb", 1024),
-    ttl_hours=config.get("cache_ttl_hours", 168),
-)
+- 在 `cli.py` 中包装 LLM 客户端：`llm_client = CachedLLMClient(raw_client, cache=cache)`
+- 缓存键包含图片文件修改时间，文件变更自动失效缓存
+- 提供缓存统计和清空命令
 
-# Wrap LLM client with cache
-llm_client = CachedLLMClient(raw_client, cache=cache)
+## 验证清单
+
+- [ ] 同一视频第二次运行速度提升 50% 以上
+- [ ] 日志中显示缓存命中率
+- [ ] 修改提示词文件后相关缓存失效
+- [ ] 缓存遵守 TTL 和大小限制
+- [ ] SQLite 缓存在并行分析中线程安全
+
+## 示例用法
+
 ```
-
-## Verification
-
-- [ ] Second run of same video is >50% faster
-- [ ] Cache hit rate is reported in logs
-- [ ] Changing prompt file invalidates relevant cache entries
-- [ ] Cache respects TTL and max size limits
-- [ ] SQLite cache is thread-safe for parallel analysis
+/smart-prompt-cache max_cache_mb=1024 cache_ttl_hours=168
+/smart-prompt-cache cache_dir="~/.cache/video-analyzer" cache_analyses=true
+```
