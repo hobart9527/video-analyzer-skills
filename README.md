@@ -41,20 +41,26 @@ vas show gpu-auto-config
 ### 安装技能到目标平台
 
 ```bash
-# 安装到 Claude Code
+# 安装到 Claude Code（全局）
 vas install --target claude-code
 
-# 安装到 Codex
+# 安装到 Codex（全局）
 vas install --target codex
 
-# 安装到 OpenClaw
+# 安装到 OpenClaw（项目级）
 vas install --target openclaw
 
 # 安装到所有平台
 vas install --target all
 
+# 项目级安装（安装到当前目录的 .claude/skills、.codex、.openclaw）
+vas install --target claude-code --project
+
 # 安装到指定目录
 vas install --target claude-code --dest /path/to/video-analyzer/.claude/skills
+
+# 只安装指定技能
+vas install --target claude-code gpu-auto-config parallel-frame-analysis
 ```
 
 ### 检查环境

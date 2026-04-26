@@ -13,6 +13,7 @@ def _get_project_root() -> Path:
 def _install_claude_code(
     dest: Optional[Path] = None,
     skills: Optional[List[str]] = None,
+    project: bool = False,
 ) -> List[str]:
     """Install Claude Code skills. Returns list of installed paths."""
     results = []
@@ -22,7 +23,10 @@ def _install_claude_code(
         return results
 
     if dest is None:
-        dest = Path.home() / ".claude" / "skills"
+        if project:
+            dest = Path.cwd() / ".claude" / "skills"
+        else:
+            dest = Path.home() / ".claude" / "skills"
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -38,6 +42,7 @@ def _install_claude_code(
 def _install_codex(
     dest: Optional[Path] = None,
     skills: Optional[List[str]] = None,
+    project: bool = False,
 ) -> List[str]:
     """Install Codex skills. Returns list of installed paths."""
     results = []
@@ -47,7 +52,10 @@ def _install_codex(
         return results
 
     if dest is None:
-        dest = Path.home() / ".codex"
+        if project:
+            dest = Path.cwd() / ".codex"
+        else:
+            dest = Path.home() / ".codex"
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -60,6 +68,7 @@ def _install_codex(
 def _install_openclaw(
     dest: Optional[Path] = None,
     skills: Optional[List[str]] = None,
+    project: bool = False,
 ) -> List[str]:
     """Install OpenClaw skills. Returns list of installed paths."""
     results = []
@@ -69,7 +78,6 @@ def _install_openclaw(
         return results
 
     if dest is None:
-        # OpenClaw typically uses project-level config
         dest = Path.cwd() / ".openclaw"
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -91,6 +99,7 @@ def install(
     target: str,
     dest: Optional[Path] = None,
     skills: Optional[List[str]] = None,
+    project: bool = False,
 ) -> List[str]:
     """Install skills to the specified target.
 
@@ -98,16 +107,18 @@ def install(
         target: One of "claude-code", "codex", "openclaw", or "all".
         dest: Optional destination directory. Uses default if None.
         skills: Optional list of skill names to filter. All if None.
+        project: If True, install to project-level dirs instead of global.
 
     Returns:
         List of installed file paths.
     """
     installed = []
+    kwargs = {"dest": dest, "skills": skills, "project": project}
     if target == "all":
         for t in TARGETS:
-            installed.extend(TARGETS[t](dest, skills))
+            installed.extend(TARGETS[t](**kwargs))
     elif target in TARGETS:
-        installed.extend(TARGETS[target](dest, skills))
+        installed.extend(TARGETS[target](**kwargs))
     else:
         raise ValueError(f"Unknown target: {target}. Choose from: {', '.join(TARGETS)} or all")
     return installed

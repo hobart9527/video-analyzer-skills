@@ -88,8 +88,10 @@ def show_skill(name: str, plat: str) -> None:
               help="Target platform to install skills to")
 @click.option("--dest", type=click.Path(),
               help="Override default installation directory")
+@click.option("--project", is_flag=True,
+              help="Install to project-level directories (.claude/skills, .codex, .openclaw)")
 @click.argument("skills", nargs=-1)
-def install_skills(target: str, dest: str | None, skills: tuple[str, ...]) -> None:
+def install_skills(target: str, dest: str | None, project: bool, skills: tuple[str, ...]) -> None:
     """Install skills to the target platform.
 
     SKILLS are optional skill names to filter (e.g. 'gpu-auto-config').
@@ -103,7 +105,7 @@ def install_skills(target: str, dest: str | None, skills: tuple[str, ...]) -> No
     skill_list = list(skills) if skills else None
 
     try:
-        installed = install(target=target, dest=dest_path, skills=skill_list)
+        installed = install(target=target, dest=dest_path, skills=skill_list, project=project)
     except ValueError as e:
         click.echo(click.style(f"Error: {e}", fg="red"))
         raise click.Exit(1)
